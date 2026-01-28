@@ -105,8 +105,8 @@ Common flags:
 
 Measured on Linux, Intel iGPU, 32GB RAM, image 1080x1920, `--max-new-tokens 32`, `--trim-memory`:
 
-- `vulkan`: peak process RSS ~4.5 GiB
-- `ndarray`: peak process RSS ~15.7 GiB
+- `vulkan`: peak process RSS ~2.9 GiB
+- `ndarray`: peak process RSS ~15.2 GiB
 
 Notes:
 
@@ -124,4 +124,3 @@ expect slower inference and higher memory usage in many configurations.
 ## License
 
 See `LICENSE`.
-
