@@ -1,0 +1,17 @@
+/target
+**/target
+
+# Model weights / caches (keep them out of git).
+hf_deepseek_ocr2/
+_hf_modules_cache/
+_tmp/
+__pycache__/
+
+*.safetensors
+*.safetensors.index.json
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+
