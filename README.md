@@ -23,14 +23,13 @@ integrated GPUs.
 
 Download the model files into `hf_deepseek_ocr2/` at the repository root.
 
-### Option A: `huggingface-cli`
+### Option A: `hf` (Hugging Face CLI)
 
 ```bash
-pip install -U huggingface-hub
+pip install -U "huggingface-hub[cli]"
 
-huggingface-cli download deepseek-ai/DeepSeek-OCR-2 \
+hf download deepseek-ai/DeepSeek-OCR-2 \
   --local-dir hf_deepseek_ocr2 \
-  --local-dir-use-symlinks False \
   --include "model-*.safetensors" "tokenizer.json"
 ```
 
