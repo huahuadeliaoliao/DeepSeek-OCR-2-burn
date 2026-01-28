@@ -39,12 +39,6 @@ You should end up with:
 - `hf_deepseek_ocr2/model-00001-of-000001.safetensors`
 - `hf_deepseek_ocr2/tokenizer.json`
 
-## Build
-
-```bash
-cargo build --release
-```
-
 ## Usage
 
 ### OCR (image -> text)
@@ -59,11 +53,11 @@ Free OCR.
 Run OCR on an image:
 
 ```bash
-./target/release/deepseek_ocr2_burn generate-ocr \
+cargo run --release -- generate-ocr \
   --backend vulkan \
   --weights hf_deepseek_ocr2/model-00001-of-000001.safetensors \
   --tokenizer hf_deepseek_ocr2/tokenizer.json \
-  --image path/to/image.jpg \
+  --image assets/example.png \
   --auto-rotate
 ```
 
@@ -80,7 +74,7 @@ Common flags:
 ### Text-only generation
 
 ```bash
-./target/release/deepseek_ocr2_burn generate-text \
+cargo run --release -- generate-text \
   --backend vulkan \
   --weights hf_deepseek_ocr2/model-00001-of-000001.safetensors \
   --tokenizer hf_deepseek_ocr2/tokenizer.json \
@@ -103,10 +97,19 @@ Common flags:
 
 ## Memory Usage (Example)
 
-Measured on Linux, Intel iGPU, 32GB RAM, image 1080x1920, `--max-new-tokens 32`, `--trim-memory`:
+Measured on Linux, Intel iGPU, 32GB RAM, `assets/example.png`, `--max-new-tokens 32`.
 
-- `vulkan`: peak process RSS ~2.9 GiB
-- `ndarray`: peak process RSS ~15.2 GiB
+Because the Vulkan (wgpu) backend uses unified-memory/driver allocations that don't necessarily
+show up as process RSS, the most representative metric here is **peak system RAM used**
+(`MemTotal - MemAvailable`, sampled during the run).
+
+- `vulkan`: peak system RAM used +17.8 GiB (extra over baseline)
+- `ndarray`: peak system RAM used +13.8 GiB (extra over baseline)
+
+For reference, **peak process RSS** during the same runs:
+
+- `vulkan`: ~2.8 GiB
+- `ndarray`: ~15.4 GiB
 
 Notes:
 
