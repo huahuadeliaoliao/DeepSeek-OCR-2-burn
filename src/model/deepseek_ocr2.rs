@@ -261,6 +261,20 @@ impl<B: Backend> DeepseekOcr2ForCausalLM<B> {
         self.logits_from_hidden(hidden)
     }
 
+    /// Forward pass that only computes logits for the last token.
+    ///
+    /// This avoids the very expensive `[batch * seq, vocab]` projection on long prompts.
+    #[allow(dead_code)]
+    pub fn forward_last(
+        &self,
+        input_ids: Tensor<B, 2, Int>,
+        caches: &mut Vec<Option<KvCache<B>>>,
+    ) -> Tensor<B, 3> {
+        let hidden = self.model.forward(input_ids, caches);
+        self.logits_last_from_hidden(hidden)
+    }
+
+    #[allow(dead_code)]
     pub fn forward_embeds(
         &self,
         inputs_embeds: Tensor<B, 3>,
@@ -270,11 +284,31 @@ impl<B: Backend> DeepseekOcr2ForCausalLM<B> {
         self.logits_from_hidden(hidden)
     }
 
+    pub fn forward_embeds_last(
+        &self,
+        inputs_embeds: Tensor<B, 3>,
+        caches: &mut Vec<Option<KvCache<B>>>,
+    ) -> Tensor<B, 3> {
+        let hidden = self.model.forward_embeds(inputs_embeds, caches);
+        self.logits_last_from_hidden(hidden)
+    }
+
     fn logits_from_hidden(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
         let [batch, seq, hidden_size] = hidden.dims();
         let vocab = self.lm_head.weight.shape().dims::<2>()[1];
         self.lm_head
             .forward(hidden.reshape([batch * seq, hidden_size]))
             .reshape([batch, seq, vocab])
+    }
+
+    fn logits_last_from_hidden(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
+        let [batch, seq, hidden_size] = hidden.dims();
+        debug_assert!(seq > 0);
+
+        let vocab = self.lm_head.weight.shape().dims::<2>()[1];
+        let last = hidden.slice([0..batch, (seq - 1)..seq, 0..hidden_size]); // [B, 1, H]
+        self.lm_head
+            .forward(last.reshape([batch, hidden_size]))
+            .reshape([batch, 1, vocab])
     }
 }

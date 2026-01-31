@@ -459,18 +459,27 @@ impl<B: Backend> LlamaSelfAttention<B> {
         let scores = q.matmul(k_all_f32.swap_dims(2, 3)).div_scalar(scale);
         dbg_stats("attn.scores", &scores);
 
-        // Causal mask for the new tokens (shape [seq_new, seq_total]).
-        let q_pos = Tensor::<B, 1, Int>::arange(past_len as i64..seq_total as i64, &device);
-        let k_pos = Tensor::<B, 1, Int>::arange(0..seq_total as i64, &device);
-        let q_pos: Tensor<B, 2, Int> = q_pos.unsqueeze_dim(1);
-        let k_pos: Tensor<B, 2, Int> = k_pos.unsqueeze_dim(0);
-        let mask_2d: Tensor<B, 2, Bool> = k_pos.greater(q_pos);
-        let mut mask: Tensor<B, 4, Bool> = mask_2d.unsqueeze();
-        mask = mask.repeat_dim(0, batch).repeat_dim(1, self.n_heads);
+        // Causal mask.
+        //
+        // Optimization: during decoding we always pass `seq_new == 1` (one token at a time). In that
+        // case, `k_all` only contains keys up to the current position, so there are no "future"
+        // positions to mask out. Skipping mask construction saves a lot of work on GPU backends.
+        let weights = if seq_new == 1 {
+            softmax(scores, 3)
+        } else {
+            // Causal mask for the new tokens (shape [seq_new, seq_total]).
+            let q_pos = Tensor::<B, 1, Int>::arange(past_len as i64..seq_total as i64, &device);
+            let k_pos = Tensor::<B, 1, Int>::arange(0..seq_total as i64, &device);
+            let q_pos: Tensor<B, 2, Int> = q_pos.unsqueeze_dim(1);
+            let k_pos: Tensor<B, 2, Int> = k_pos.unsqueeze_dim(0);
+            let mask_2d: Tensor<B, 2, Bool> = k_pos.greater(q_pos);
+            let mut mask: Tensor<B, 4, Bool> = mask_2d.unsqueeze();
+            mask = mask.repeat_dim(0, batch).repeat_dim(1, self.n_heads);
 
-        // Mask out future positions.
-        let scores = scores.mask_fill(mask, -1.0e4);
-        let weights = softmax(scores, 3);
+            // Mask out future positions.
+            let scores = scores.mask_fill(mask, -1.0e4);
+            softmax(scores, 3)
+        };
         dbg_stats("attn.weights", &weights);
 
         let context = weights.matmul(v_all_f32); // [batch, heads, seq_new, head_dim]
@@ -619,6 +628,39 @@ impl<B: Backend> MoEMlp<B> {
         if std::env::var("DEEPSEEK_DEBUG_MOE").is_ok() {
             eprintln!("debug: moe topk_idx={topk_idx_cpu:?}");
             eprintln!("debug: moe topk_weight(f32)={topk_weight_cpu:?}");
+        }
+
+        // Fast path for autoregressive decoding (seq == 1):
+        // avoid token replication + sorting + select/cat overhead.
+        if n_tokens == 1 {
+            let mut routed_f32: Option<Tensor<B, 2>> = None;
+            for (expert_id, &w) in topk_idx_cpu.iter().zip(topk_weight_cpu.iter()) {
+                let expert_id = *expert_id as usize;
+                let y = self.experts[expert_id]
+                    .forward(x_flat.clone())
+                    .cast(DType::F32)
+                    .mul_scalar(w);
+                routed_f32 = Some(match routed_f32 {
+                    Some(acc) => acc + y,
+                    None => y,
+                });
+            }
+
+            let routed = routed_f32
+                .unwrap_or_else(|| Tensor::<B, 2>::zeros([n_tokens, hidden], &device))
+                .cast(dtype)
+                .reshape([batch, seq, hidden]);
+
+            let shared = self
+                .shared_experts
+                .forward(x_flat)
+                .reshape([batch, seq, hidden]);
+
+            let out = routed + shared;
+            if std::env::var("DEEPSEEK_DEBUG_MOE").is_ok() {
+                dbg_stats("moe.out_total", &out);
+            }
+            return out;
         }
 
         let topk_weight: Tensor<B, 2> = Tensor::from_data(
@@ -862,6 +904,18 @@ impl<B: Backend> DeepseekV2ForCausalLM<B> {
         self.logits_from_hidden(hidden)
     }
 
+    /// Forward pass that only computes logits for the last token.
+    ///
+    /// This avoids the very expensive `[batch * seq, vocab]` projection on long prompts.
+    pub fn forward_last(
+        &self,
+        input_ids: Tensor<B, 2, Int>,
+        caches: &mut Vec<Option<KvCache<B>>>,
+    ) -> Tensor<B, 3> {
+        let hidden = self.model.forward(input_ids, caches);
+        self.logits_last_from_hidden(hidden)
+    }
+
     #[allow(dead_code)]
     pub fn forward_embeds(
         &self,
@@ -872,11 +926,32 @@ impl<B: Backend> DeepseekV2ForCausalLM<B> {
         self.logits_from_hidden(hidden)
     }
 
+    #[allow(dead_code)]
+    pub fn forward_embeds_last(
+        &self,
+        inputs_embeds: Tensor<B, 3>,
+        caches: &mut Vec<Option<KvCache<B>>>,
+    ) -> Tensor<B, 3> {
+        let hidden = self.model.forward_embeds(inputs_embeds, caches);
+        self.logits_last_from_hidden(hidden)
+    }
+
     fn logits_from_hidden(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
         let [batch, seq, hidden_size] = hidden.dims();
         let vocab = self.lm_head.weight.shape().dims::<2>()[1];
         self.lm_head
             .forward(hidden.reshape([batch * seq, hidden_size]))
             .reshape([batch, seq, vocab])
+    }
+
+    fn logits_last_from_hidden(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
+        let [batch, seq, hidden_size] = hidden.dims();
+        debug_assert!(seq > 0);
+
+        let vocab = self.lm_head.weight.shape().dims::<2>()[1];
+        let last = hidden.slice([0..batch, (seq - 1)..seq, 0..hidden_size]); // [B, 1, H]
+        self.lm_head
+            .forward(last.reshape([batch, hidden_size]))
+            .reshape([batch, 1, vocab])
     }
 }

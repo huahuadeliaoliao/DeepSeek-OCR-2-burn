@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod model;
 mod store_adapters;
 
@@ -901,7 +903,8 @@ fn cmd_generate_text_vulkan(opts: &GenerateTextOpts) -> anyhow::Result<()> {
             eprintln!("debug: after mlp residual nan={nan} min={min} max={max}");
         }
 
-        model.forward(ids, &mut caches)
+        // Only compute logits for the last token (avoids an expensive `[prompt_len, vocab]` projection).
+        model.forward_last(ids, &mut caches)
     };
 
     if std::env::var("DEEPSEEK_DEBUG_TOPK").is_ok() {
@@ -1049,7 +1052,8 @@ fn cmd_generate_text_ndarray(opts: &GenerateTextOpts) -> anyhow::Result<()> {
     let mut logits = {
         let data = burn::tensor::TensorData::new(input_ids.clone(), [1, prompt_len]);
         let ids = Tensor::<B, 2, Int>::from_data(data, &device);
-        model.forward(ids, &mut caches)
+        // Only compute logits for the last token (avoids an expensive `[prompt_len, vocab]` projection).
+        model.forward_last(ids, &mut caches)
     };
 
     if std::env::var("DEEPSEEK_DEBUG_TOPK").is_ok() {
@@ -1082,18 +1086,16 @@ fn cmd_generate_text_ndarray(opts: &GenerateTextOpts) -> anyhow::Result<()> {
 
     for _ in 0..opts.max_new_tokens {
         let [_, seq, vocab] = logits.dims();
-        let last = logits
-            .clone()
-            .slice([0..1, (seq - 1)..seq, 0..vocab])
-            .cast(DType::F32)
-            .into_data()
-            .to_vec::<f32>()
-            .context("failed to read logits")?;
-        let (best_i, _best_v, nan) = argmax_f32(&last, None);
-        if nan > 0 {
-            eprintln!("warning: argmax saw {nan} NaNs in logits");
-        }
-        let next_id = best_i as i64;
+        let last_t = logits.clone().slice([0..1, (seq - 1)..seq, 0..vocab]);
+        let next_id = {
+            let idx = last_t.argmax(2);
+            let idx = idx
+                .into_data()
+                // NdArray uses i32 for Int tensors (same as Vulkan/WGPU).
+                .to_vec::<i32>()
+                .context("failed to read argmax id")?;
+            idx[0] as i64
+        };
 
         input_ids.push(next_id);
         if next_id == opts.eos_token_id {
@@ -1461,7 +1463,8 @@ fn cmd_generate_ocr_vulkan(opts: &GenerateOcrOpts) -> anyhow::Result<()> {
     }
 
     let mut caches: Vec<Option<KvCache<B>>> = Vec::new();
-    let mut logits = model.forward_embeds(inputs_embeds, &mut caches);
+    // Only compute logits for the last token (avoids an expensive `[prompt_len, vocab]` projection).
+    let mut logits = model.forward_embeds_last(inputs_embeds, &mut caches);
 
     if std::env::var("DEEPSEEK_DEBUG_TOPK").is_ok() {
         let [_, seq, vocab] = logits.dims();
@@ -1675,7 +1678,8 @@ fn cmd_generate_ocr_ndarray(opts: &GenerateOcrOpts) -> anyhow::Result<()> {
         .context("failed to build multimodal embeddings")?;
 
     let mut caches: Vec<Option<KvCache<B>>> = Vec::new();
-    let mut logits = model.forward_embeds(inputs_embeds, &mut caches);
+    // Only compute logits for the last token (avoids an expensive `[prompt_len, vocab]` projection).
+    let mut logits = model.forward_embeds_last(inputs_embeds, &mut caches);
 
     if std::env::var("DEEPSEEK_DEBUG_TOPK").is_ok() {
         let [_, seq, vocab] = logits.dims();
@@ -1705,33 +1709,42 @@ fn cmd_generate_ocr_ndarray(opts: &GenerateOcrOpts) -> anyhow::Result<()> {
         );
     }
 
-    for _ in 0..opts.max_new_tokens {
+    for _step in 0..opts.max_new_tokens {
         let [_, seq, vocab] = logits.dims();
-        let last = logits
-            .clone()
-            .slice([0..1, (seq - 1)..seq, 0..vocab])
-            .cast(DType::F32);
-        let last = last
-            .into_data()
-            .to_vec::<f32>()
-            .context("failed to read logits")?;
-        let banned = no_repeat_ngram_banned_ids(&input_ids_vec, opts.no_repeat_ngram_size);
-        let banned = if banned.is_empty() {
-            None
-        } else {
+        let last_t = logits.clone().slice([0..1, (seq - 1)..seq, 0..vocab]);
+
+        let banned_ids = no_repeat_ngram_banned_ids(&input_ids_vec, opts.no_repeat_ngram_size);
+
+        // Fast path: argmax on the backend (CPU for NdArray).
+        let mut next_id: i64 = {
+            let idx = last_t.clone().argmax(2);
+            let idx = idx
+                .into_data()
+                .to_vec::<i32>()
+                .context("failed to read argmax id")?;
+            idx[0] as i64
+        };
+
+        // If constraints are active and we hit a banned id, fall back to a CPU scan of logits.
+        if !banned_ids.is_empty() && banned_ids.iter().any(|&b| b as i64 == next_id) {
+            let last = last_t
+                .clone()
+                .cast(DType::F32)
+                .into_data()
+                .to_vec::<f32>()
+                .context("failed to read logits")?;
             let mut mask = vec![false; vocab];
-            for id in banned {
+            for id in banned_ids {
                 if id < vocab {
                     mask[id] = true;
                 }
             }
-            Some(mask)
-        };
-        let (best_i, _best_v, nan) = argmax_f32(&last, banned.as_deref());
-        if nan > 0 {
-            eprintln!("warning: argmax saw {nan} NaNs in logits");
+            let (best_i, _best_v, nan) = argmax_f32(&last, Some(&mask));
+            if nan > 0 {
+                eprintln!("warning: argmax saw {nan} NaNs in logits");
+            }
+            next_id = best_i as i64;
         }
-        let next_id = best_i as i64;
 
         input_ids_vec.push(next_id);
         if next_id == opts.eos_token_id {
