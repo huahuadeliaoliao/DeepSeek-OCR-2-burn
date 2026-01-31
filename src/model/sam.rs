@@ -8,7 +8,6 @@ use burn::nn::conv::{Conv2d, Conv2dConfig};
 use burn::nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig};
 use burn::tensor::activation::{gelu, softmax};
 use burn::tensor::backend::Backend;
-use burn::tensor::ops::PadMode;
 use burn::tensor::ops::{GridSampleOptions, GridSamplePaddingMode, InterpolateMode};
 use burn::tensor::{DType, Int, Tensor};
 
@@ -191,7 +190,9 @@ fn window_partition<B: Backend>(
 
     let x = if pad_h > 0 || pad_w > 0 {
         let x_nchw = nhwc_to_nchw(x);
-        let x_nchw = x_nchw.pad((0, pad_w, 0, pad_h), PadMode::Constant(0.0));
+        // Burn's `Tensor::pad` currently trips a Fusion DTypeMismatch on some backends when the
+        // tensor is F16. Use an explicit zero-pad with `slice_assign` to keep the dtype stable.
+        let x_nchw = pad_nchw_zeros(x_nchw, pad_h, pad_w);
         nchw_to_nhwc(x_nchw)
     } else {
         x
@@ -208,6 +209,16 @@ fn window_partition<B: Backend>(
         .reshape([b * h_div * w_div, window_size, window_size, c]);
 
     (windows, (hp, wp))
+}
+
+fn pad_nchw_zeros<B: Backend>(x: Tensor<B, 4>, pad_h: usize, pad_w: usize) -> Tensor<B, 4> {
+    let device = x.device();
+    let dtype = x.dtype();
+    let [b, c, h, w] = x.dims();
+
+    let mut out = Tensor::<B, 4>::zeros([b, c, h + pad_h, w + pad_w], &device).cast(dtype);
+    out = out.slice_assign([0..b, 0..c, 0..h, 0..w], x);
+    out
 }
 
 fn window_unpartition<B: Backend>(
@@ -247,7 +258,7 @@ fn get_rel_pos<B: Backend>(
     let [l, head_dim] = rel_pos.dims();
     let rel_pos = if l != max_rel_dist {
         // Resize along the "length" dimension, matching PyTorch
-        // `F.interpolate(..., mode=\"linear\", align_corners=False)`.
+        // `F.interpolate(..., mode="linear", align_corners=False)`.
         //
         // Burn's `interpolate` currently behaves like `align_corners=True`, so we use `grid_sample`
         // with `align_corners=false` instead.

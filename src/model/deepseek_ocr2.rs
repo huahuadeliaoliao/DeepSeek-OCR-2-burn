@@ -193,37 +193,56 @@ impl<B: Backend> DeepseekOcr2Model<B> {
         let vision = vision.cast(embed_dtype);
         dbg_stats("vision.tokens", &vision);
 
+        let [n_img, _] = vision.dims();
+
         // Collect target positions for image tokens.
-        let mut img_pos: Vec<i64> = Vec::new();
-        let mut keep_mask: Vec<f32> = Vec::with_capacity(seq);
+        let mut img_pos: Vec<usize> = Vec::new();
         for (i, &is_img) in images_seq_mask.iter().enumerate() {
             if is_img {
-                img_pos.push(i as i64);
-                keep_mask.push(0.0);
-            } else {
-                keep_mask.push(1.0);
+                img_pos.push(i);
             }
         }
-
-        let [n_img, _] = vision.dims();
         anyhow::ensure!(
             img_pos.len() == n_img,
             "image token count mismatch (mask_true={}, vision_tokens={n_img})",
             img_pos.len()
         );
 
-        // Zero-out the placeholder rows in the base embeddings.
+        // Fast path: the tokenizer expands `<image>` into a single contiguous block of placeholder
+        // tokens, so we can use `slice_assign` instead of a huge scatter index tensor.
+        //
+        // This avoids:
+        // - building an `[n_img, hidden]` integer index on CPU (hundreds of thousands of entries),
+        // - uploading it to the GPU, and
+        // - running a scatter kernel just to replace rows.
+        if !img_pos.is_empty() && img_pos.windows(2).all(|w| w[1] == w[0].saturating_add(1)) {
+            let start = img_pos[0];
+            let end = start + n_img;
+            anyhow::ensure!(
+                end <= seq,
+                "image token block out of bounds (start={start}, end={end}, seq={seq})"
+            );
+            let merged = base.slice_assign([start..end, 0..hidden], vision);
+            dbg_stats("mm.merged", &merged);
+            return Ok(merged.unsqueeze::<3>());
+        }
+
+        // Slow fallback: non-contiguous masks (shouldn't happen for our current prompt format).
+        //
+        // Burn currently only supports scatter add; we emulate assignment by zeroing first.
+        let mut keep_mask: Vec<f32> = Vec::with_capacity(seq);
+        for &is_img in images_seq_mask.iter() {
+            keep_mask.push(if is_img { 0.0 } else { 1.0 });
+        }
         let keep =
             Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(keep_mask, [seq]), &device)
                 .unsqueeze_dim::<2>(1) // [seq, 1]
                 .cast(embed_dtype);
         let base = base * keep;
 
-        // Scatter-add vision embeddings into placeholder rows.
-        // Burn currently only supports scatter add; we emulate assignment by zeroing first.
         let mut idx = Vec::with_capacity(n_img * hidden);
         for &p in img_pos.iter() {
-            idx.extend(std::iter::repeat_n(p, hidden));
+            idx.extend(std::iter::repeat_n(p as i64, hidden));
         }
         let idx = Tensor::<B, 2, Int>::from_data(
             burn::tensor::TensorData::new(idx, [n_img, hidden]),

@@ -47,12 +47,12 @@ fn dbg_stats<B: Backend, const D: usize>(name: &str, t: &Tensor<B, D>) {
 /// DeepSeek-OCR-2 sets `use_mla=false` and uses standard MHA layers (HF uses `LlamaAttention`),
 /// so we follow `transformers.models.llama.modeling_llama.apply_rotary_pos_emb`.
 fn apply_rope_half_split<B: Backend>(
-    q: Tensor<B, 4>,        // [B, H, S, D]
-    k: Tensor<B, 4>,        // [B, H, S, D]
-    inv_freq: Tensor<B, 1>, // [D/2]
+    q: Tensor<B, 4>,          // [B, H, S, D]
+    k: Tensor<B, 4>,          // [B, H, S, D]
+    cos_cache: &Tensor<B, 2>, // [max_pos, D]
+    sin_cache: &Tensor<B, 2>, // [max_pos, D]
     start: usize,
 ) -> (Tensor<B, 4>, Tensor<B, 4>) {
-    let device = q.device();
     let [bq, hq, seq, dim] = q.dims();
     let [bk, hk, seq_k, dim_k] = k.dims();
     assert_eq!(bq, bk);
@@ -62,15 +62,20 @@ fn apply_rope_half_split<B: Backend>(
     assert_eq!(dim % 2, 0);
     let half = dim / 2;
 
-    let pos = Tensor::<B, 1, Int>::arange(start as i64..(start + seq) as i64, &device).float(); // [S]
-    let freqs = pos.unsqueeze_dim::<2>(1) * inv_freq.unsqueeze_dim::<2>(0); // [S, D/2]
-    let emb = Tensor::cat(vec![freqs.clone(), freqs], 1); // [S, D]
-    let cos = emb
+    // Pre-computed RoPE cache.
+    //
+    // This avoids re-running trig kernels (cos/sin) on every layer and decode step.
+    // `cos_cache`/`sin_cache` shapes: [max_pos, D].
+    let cos = cos_cache
         .clone()
-        .cos()
+        .slice([start..(start + seq), 0..dim])
         .unsqueeze_dim::<3>(0)
         .unsqueeze_dim::<4>(0); // [1, 1, S, D]
-    let sin = emb.sin().unsqueeze_dim::<3>(0).unsqueeze_dim::<4>(0); // [1, 1, S, D]
+    let sin = sin_cache
+        .clone()
+        .slice([start..(start + seq), 0..dim])
+        .unsqueeze_dim::<3>(0)
+        .unsqueeze_dim::<4>(0); // [1, 1, S, D]
 
     let q1 = q.clone().slice([0..bq, 0..hq, 0..seq, 0..half]);
     let q2 = q.clone().slice([0..bq, 0..hq, 0..seq, half..dim]);
@@ -211,10 +216,11 @@ pub struct LlamaSelfAttention<B: Backend> {
     pub k_proj: Linear<B>,
     pub v_proj: Linear<B>,
     pub o_proj: Linear<B>,
-    /// RoPE inverse frequencies for Llama-style half-split rotation.
+    /// Pre-computed RoPE cache (cos/sin) to avoid trig ops during inference.
     ///
-    /// Shape: `[head_dim / 2]`.
-    pub inv_freq: Tensor<B, 1>,
+    /// Shapes: `[max_position_embeddings, head_dim]`.
+    pub rope_cos: Tensor<B, 2>,
+    pub rope_sin: Tensor<B, 2>,
     pub n_heads: usize,
     pub head_dim: usize,
     pub kv_cache_dtype: Ignored<DType>,
@@ -250,12 +256,21 @@ impl<B: Backend> LlamaSelfAttention<B> {
             .exp()
             .recip();
 
+        // Precompute cos/sin for all positions once per attention module.
+        let max_pos = config.max_position_embeddings;
+        let pos = Tensor::<B, 1, Int>::arange(0..max_pos as i64, device).float(); // [S]
+        let freqs = pos.unsqueeze_dim::<2>(1) * inv_freq.unsqueeze_dim::<2>(0); // [S, D/2]
+        let emb = Tensor::cat(vec![freqs.clone(), freqs], 1); // [S, D]
+        let rope_cos = emb.clone().cos();
+        let rope_sin = emb.sin();
+
         Self {
             q_proj,
             k_proj,
             v_proj,
             o_proj,
-            inv_freq,
+            rope_cos,
+            rope_sin,
             n_heads: config.num_attention_heads,
             head_dim,
             kv_cache_dtype: Ignored(config.kv_cache_dtype),
@@ -306,7 +321,7 @@ impl<B: Backend> LlamaSelfAttention<B> {
         let q = q.cast(DType::F32);
         let k = k.cast(DType::F32);
         let v = v.cast(DType::F32);
-        let (q, k) = apply_rope_half_split(q, k, self.inv_freq.clone(), past_len);
+        let (q, k) = apply_rope_half_split(q, k, &self.rope_cos, &self.rope_sin, past_len);
         dbg_stats("attn.q_rope", &q);
         dbg_stats("attn.k_rope", &k);
 
@@ -454,9 +469,22 @@ impl<B: Backend> LlamaSelfAttention<B> {
             v_all.cast(DType::F32)
         };
 
-        // Attention scores: [batch, heads, seq_new, seq_total]
+        // Attention scores.
+        //
+        // Prefill (seq_new > 1): [batch, heads, seq_new, seq_total]
+        // Decode  (seq_new == 1): compute with elementwise mul + reduce to avoid a tiny matmul.
         let scale = (self.head_dim as f64).sqrt() as f32;
-        let scores = q.matmul(k_all_f32.swap_dims(2, 3)).div_scalar(scale);
+        let scores = if seq_new == 1 {
+            // q: [B, H, 1, D], k_all: [B, H, T, D] -> [B, H, 1, T]
+            // NOTE: `sum_dim` keeps the rank and leaves the reduced dimension as size 1, so:
+            //   [B, H, T, D] --sum_dim(3)--> [B, H, T, 1] --swap_dims(2,3)--> [B, H, 1, T]
+            (k_all_f32.clone() * q.clone())
+                .sum_dim(3)
+                .swap_dims(2, 3)
+                .div_scalar(scale)
+        } else {
+            q.matmul(k_all_f32.swap_dims(2, 3)).div_scalar(scale)
+        };
         dbg_stats("attn.scores", &scores);
 
         // Causal mask.
@@ -482,7 +510,13 @@ impl<B: Backend> LlamaSelfAttention<B> {
         };
         dbg_stats("attn.weights", &weights);
 
-        let context = weights.matmul(v_all_f32); // [batch, heads, seq_new, head_dim]
+        let context = if seq_new == 1 {
+            // weights: [B, H, 1, T], v_all: [B, H, T, D] -> [B, H, 1, D]
+            let w = weights.swap_dims(2, 3); // [B, H, T, 1]
+            (v_all_f32 * w).sum_dim(2) // [B, H, 1, D]
+        } else {
+            weights.matmul(v_all_f32) // [batch, heads, seq_new, head_dim]
+        };
         dbg_stats("attn.context", &context);
         let context =
             context

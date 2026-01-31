@@ -218,6 +218,9 @@ enum Command {
         /// KV cache dtype (F32 is safest; F16 can reduce memory at the cost of potential numeric drift).
         #[arg(long, value_enum, default_value_t = KvCacheDtype::F32)]
         kv_cache: KvCacheDtype,
+        /// Vision tower dtype (F32 is safest; F16 can be faster but may be unstable on some Vulkan/WebGPU drivers).
+        #[arg(long, value_enum, default_value_t = VisionDtype::F32)]
+        vision_dtype: VisionDtype,
         /// Best-effort reduce CPU-side memory after loading weights (drop OS page cache + malloc_trim on glibc).
         #[arg(long)]
         trim_memory: bool,
@@ -245,6 +248,12 @@ enum BackendKind {
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum KvCacheDtype {
+    F32,
+    F16,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum VisionDtype {
     F32,
     F16,
 }
@@ -279,6 +288,7 @@ struct GenerateOcrOpts {
     crop_image_size: u32,
     no_repeat_ngram_size: usize,
     kv_cache: KvCacheDtype,
+    vision_dtype: VisionDtype,
     trim_memory: bool,
 }
 
@@ -581,6 +591,7 @@ fn main() -> anyhow::Result<()> {
             crop_image_size,
             no_repeat_ngram_size,
             kv_cache,
+            vision_dtype,
             trim_memory,
         } => {
             let opts = GenerateOcrOpts {
@@ -598,6 +609,7 @@ fn main() -> anyhow::Result<()> {
                 crop_image_size,
                 no_repeat_ngram_size,
                 kv_cache,
+                vision_dtype,
                 trim_memory,
             };
             cmd_generate_ocr(&opts)
@@ -1316,18 +1328,20 @@ fn cmd_generate_ocr_vulkan(opts: &GenerateOcrOpts) -> anyhow::Result<()> {
 
     // Load weights (PyTorch -> Burn).
     //
-    // On Vulkan/WebGPU, some SAM ops are unstable in F16. Keep SAM in F32 while keeping the
-    // rest of the model in F16 to save memory.
-    let adapter = ChainAdapter::new(
-        PyTorchToBurnAdapter,
-        // DeepSeek-OCR-2 weights are BF16 on HF, but BF16 is still flaky on some Vulkan/WebGPU
-        // drivers. Default to F16 for backend stability and keep the vision tower in F32.
-        SelectiveCastDTypeAdapter::new(DType::F16)
+    // DeepSeek-OCR-2 weights are BF16 on HF, but BF16 is still flaky on some Vulkan/WebGPU
+    // drivers. Default to F16 for backend stability.
+    //
+    // Vision tower default is F32 (more stable on Vulkan/WebGPU). You can opt into F16 for
+    // speed/memory via `--vision-dtype f16`.
+    let mut cast = SelectiveCastDTypeAdapter::new(DType::F16);
+    if opts.vision_dtype == VisionDtype::F32 {
+        cast = cast
             .with_prefix("model.sam_model", DType::F32)
             .with_prefix("model.qwen2_model", DType::F32)
             .with_prefix("model.projector", DType::F32)
-            .with_prefix("model.view_seperator", DType::F32),
-    );
+            .with_prefix("model.view_seperator", DType::F32);
+    }
+    let adapter = ChainAdapter::new(PyTorchToBurnAdapter, cast);
     let mut store = SafetensorsStore::from_file(&opts.weights)
         .with_from_adapter(adapter)
         .skip_enum_variants(true)
@@ -1393,17 +1407,22 @@ fn cmd_generate_ocr_vulkan(opts: &GenerateOcrOpts) -> anyhow::Result<()> {
     // Base (global) view: letterbox-pad to square.
     // HF reference uses mean=0.5 => pad color = int(0.5 * 255) = 127.
     let img_base = pad_to_square_rgb(&orig, opts.image_size, 127)?;
-    // Keep vision input in F32 (SAM weights are loaded as F32 for backend stability).
-    let image_base = image_to_tensor_nchw::<B>(&img_base, &device);
+    let mut image_base = image_to_tensor_nchw::<B>(&img_base, &device);
+    if opts.vision_dtype == VisionDtype::F16 {
+        image_base = image_base.cast(DType::F16);
+    }
 
     // Local crops (optional): stack into a single [P, 3, crop_image_size, crop_image_size] tensor.
-    let patches = patches.map(|crops| {
+    let mut patches = patches.map(|crops| {
         let mut tensors = Vec::with_capacity(crops.len());
         for crop in crops.iter() {
             tensors.push(image_to_tensor_nchw::<B>(crop, &device));
         }
         Tensor::cat(tensors, 0)
     });
+    if opts.vision_dtype == VisionDtype::F16 {
+        patches = patches.map(|t| t.cast(DType::F16));
+    }
 
     // Build input ids tensor.
     let data = burn::tensor::TensorData::new(input_ids_vec.clone(), [1, prompt_len]);
