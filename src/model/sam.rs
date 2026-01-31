@@ -58,7 +58,17 @@ fn resize_nchw_align_corners_false<B: Backend>(
         .with_padding_mode(GridSamplePaddingMode::Zeros)
         .with_align_corners(false);
 
-    x.grid_sample_2d(grid, options)
+    // NOTE: On some Vulkan/WebGPU drivers, Burn's `grid_sample_2d` is unreliable for F16/BF16
+    // inputs (we observed near-zero outputs in the SAM local-crop path).
+    // Do the interpolation in F32, then cast back to preserve the caller's dtype.
+    let dtype = x.dtype();
+    let x = x.cast(DType::F32);
+    let y = x.grid_sample_2d(grid, options);
+    if dtype == DType::F32 {
+        y
+    } else {
+        y.cast(dtype)
+    }
 }
 
 fn resize_nchw_align_corners_true<B: Backend>(
@@ -334,6 +344,7 @@ impl<B: Backend> Attention<B> {
 
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
         let device = x.device();
+        let out_dtype = x.dtype();
         let [b, h, w, dim] = x.dims();
         let l = h * w;
 
@@ -385,10 +396,10 @@ impl<B: Backend> Attention<B> {
             .mul_scalar(self.scale)
             .add(attn_bias);
 
-        // Upcast softmax to F32 for numerical stability and backend correctness.
-        let scores_dtype = scores.dtype();
-        let weights = softmax(scores.cast(DType::F32), 3).cast(scores_dtype);
-        let ctx = weights.matmul(v); // [B, heads, L, head_dim]
+        // Upcast softmax and the value projection matmul to F32 for numerical stability and
+        // backend correctness (especially when running the vision tower in F16 on Vulkan/WebGPU).
+        let weights = softmax(scores.cast(DType::F32), 3);
+        let ctx = weights.matmul(v.cast(DType::F32)).cast(out_dtype); // [B, heads, L, head_dim]
 
         let ctx = ctx
             .reshape([b, self.num_heads, h, w, self.head_dim])

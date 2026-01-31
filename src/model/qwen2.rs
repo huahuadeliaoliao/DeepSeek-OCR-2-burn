@@ -176,6 +176,7 @@ impl<B: Backend> Qwen2Attention<B> {
 
     pub fn forward(&self, x: Tensor<B, 3>, mask: Tensor<B, 4, Bool>) -> Tensor<B, 3> {
         let [batch, seq, _] = x.dims();
+        let out_dtype = x.dtype();
 
         let q = self.q_proj.forward(x.clone());
         let k = self.k_proj.forward(x.clone());
@@ -194,17 +195,15 @@ impl<B: Backend> Qwen2Attention<B> {
 
         // RoPE (Qwen2/Llama style: half split).
         //
-        // NOTE: Apply RoPE in F32 for numerical stability and backend correctness.
-        let q_dtype = q.dtype();
-        let k_dtype = k.dtype();
+        // NOTE: Do RoPE + attention in F32 for numerical stability and backend correctness
+        // (especially important when the vision tower weights are F16 on Vulkan/WebGPU).
         let (q, k) = apply_rope_half_split(
             q.clone().cast(DType::F32),
             k.clone().cast(DType::F32),
             self.inv_freq.clone(),
             0,
         );
-        let q = q.cast(q_dtype);
-        let k = k.cast(k_dtype);
+        let v = v.cast(DType::F32);
 
         // Expand KV heads (GQA) => [B, heads, seq, head_dim]
         let group = self.n_heads / self.n_kv_heads;
@@ -225,15 +224,13 @@ impl<B: Backend> Qwen2Attention<B> {
             .matmul(k.swap_dims(2, 3))
             .div_scalar(scale)
             .mask_fill(mask, -1.0e4);
-        // Upcast softmax to F32 for numerical stability and backend correctness.
-        let scores_dtype = scores.dtype();
-        let weights = softmax(scores.cast(DType::F32), 3).cast(scores_dtype);
+        let weights = softmax(scores, 3);
         let ctx = weights.matmul(v); // [B, heads, seq, head_dim]
 
         let ctx = ctx
             .swap_dims(1, 2)
             .reshape([batch, seq, self.n_heads * self.head_dim]);
-        self.o_proj.forward(ctx)
+        self.o_proj.forward(ctx.cast(out_dtype))
     }
 }
 

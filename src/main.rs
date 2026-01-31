@@ -221,6 +221,26 @@ enum Command {
         /// Vision tower dtype (F32 is safest; F16 can be faster but may be unstable on some Vulkan/WebGPU drivers).
         #[arg(long, value_enum, default_value_t = VisionDtype::F32)]
         vision_dtype: VisionDtype,
+        /// Override SAM (image encoder) dtype.
+        ///
+        /// Useful for diagnosing which vision component is numerically sensitive under FP16.
+        #[arg(long, value_enum)]
+        sam_dtype: Option<VisionDtype>,
+        /// Override Qwen2 (vision encoder) dtype.
+        ///
+        /// Useful for diagnosing which vision component is numerically sensitive under FP16.
+        #[arg(long, value_enum)]
+        qwen2_dtype: Option<VisionDtype>,
+        /// Override projector dtype.
+        ///
+        /// Useful for diagnosing which vision component is numerically sensitive under FP16.
+        #[arg(long, value_enum)]
+        projector_dtype: Option<VisionDtype>,
+        /// Override view separator dtype.
+        ///
+        /// Useful for diagnosing which vision component is numerically sensitive under FP16.
+        #[arg(long, value_enum)]
+        view_seperator_dtype: Option<VisionDtype>,
         /// Best-effort reduce CPU-side memory after loading weights (drop OS page cache + malloc_trim on glibc).
         #[arg(long)]
         trim_memory: bool,
@@ -289,6 +309,10 @@ struct GenerateOcrOpts {
     no_repeat_ngram_size: usize,
     kv_cache: KvCacheDtype,
     vision_dtype: VisionDtype,
+    sam_dtype: Option<VisionDtype>,
+    qwen2_dtype: Option<VisionDtype>,
+    projector_dtype: Option<VisionDtype>,
+    view_seperator_dtype: Option<VisionDtype>,
     trim_memory: bool,
 }
 
@@ -592,6 +616,10 @@ fn main() -> anyhow::Result<()> {
             no_repeat_ngram_size,
             kv_cache,
             vision_dtype,
+            sam_dtype,
+            qwen2_dtype,
+            projector_dtype,
+            view_seperator_dtype,
             trim_memory,
         } => {
             let opts = GenerateOcrOpts {
@@ -610,6 +638,10 @@ fn main() -> anyhow::Result<()> {
                 no_repeat_ngram_size,
                 kv_cache,
                 vision_dtype,
+                sam_dtype,
+                qwen2_dtype,
+                projector_dtype,
+                view_seperator_dtype,
                 trim_memory,
             };
             cmd_generate_ocr(&opts)
@@ -1329,17 +1361,26 @@ fn cmd_generate_ocr_vulkan(opts: &GenerateOcrOpts) -> anyhow::Result<()> {
     // Load weights (PyTorch -> Burn).
     //
     // DeepSeek-OCR-2 weights are BF16 on HF, but BF16 is still flaky on some Vulkan/WebGPU
-    // drivers. Default to F16 for backend stability.
-    //
-    // Vision tower default is F32 (more stable on Vulkan/WebGPU). You can opt into F16 for
-    // speed/memory via `--vision-dtype f16`.
+    // drivers. Default to F16 for backend stability, and selectively keep parts in F32.
     let mut cast = SelectiveCastDTypeAdapter::new(DType::F16);
-    if opts.vision_dtype == VisionDtype::F32 {
-        cast = cast
-            .with_prefix("model.sam_model", DType::F32)
-            .with_prefix("model.qwen2_model", DType::F32)
-            .with_prefix("model.projector", DType::F32)
-            .with_prefix("model.view_seperator", DType::F32);
+
+    let effective = |override_opt: Option<VisionDtype>| override_opt.unwrap_or(opts.vision_dtype);
+    let sam_dtype = effective(opts.sam_dtype);
+    let qwen2_dtype = effective(opts.qwen2_dtype);
+    let projector_dtype = effective(opts.projector_dtype);
+    let view_seperator_dtype = effective(opts.view_seperator_dtype);
+
+    if sam_dtype == VisionDtype::F32 {
+        cast = cast.with_prefix("model.sam_model", DType::F32);
+    }
+    if qwen2_dtype == VisionDtype::F32 {
+        cast = cast.with_prefix("model.qwen2_model", DType::F32);
+    }
+    if projector_dtype == VisionDtype::F32 {
+        cast = cast.with_prefix("model.projector", DType::F32);
+    }
+    if view_seperator_dtype == VisionDtype::F32 {
+        cast = cast.with_prefix("model.view_seperator", DType::F32);
     }
     let adapter = ChainAdapter::new(PyTorchToBurnAdapter, cast);
     let mut store = SafetensorsStore::from_file(&opts.weights)
@@ -1408,7 +1449,7 @@ fn cmd_generate_ocr_vulkan(opts: &GenerateOcrOpts) -> anyhow::Result<()> {
     // HF reference uses mean=0.5 => pad color = int(0.5 * 255) = 127.
     let img_base = pad_to_square_rgb(&orig, opts.image_size, 127)?;
     let mut image_base = image_to_tensor_nchw::<B>(&img_base, &device);
-    if opts.vision_dtype == VisionDtype::F16 {
+    if sam_dtype == VisionDtype::F16 {
         image_base = image_base.cast(DType::F16);
     }
 
@@ -1420,7 +1461,7 @@ fn cmd_generate_ocr_vulkan(opts: &GenerateOcrOpts) -> anyhow::Result<()> {
         }
         Tensor::cat(tensors, 0)
     });
-    if opts.vision_dtype == VisionDtype::F16 {
+    if sam_dtype == VisionDtype::F16 {
         patches = patches.map(|t| t.cast(DType::F16));
     }
 

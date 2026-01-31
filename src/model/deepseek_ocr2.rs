@@ -163,11 +163,27 @@ impl<B: Backend> DeepseekOcr2Model<B> {
         // On Vulkan/WebGPU, Qwen2 vision ops are unstable in F16 for this model. Keep the whole
         // vision tower in F32, then cast to the language embedding dtype at the end.
         let global = {
-            let feats = self.sam_model.forward(image_base); // [1, 896, 16, 16] (for 1024)
+            let mut feats = self.sam_model.forward(image_base); // [1, 896, H, W]
             dbg_stats("vision.global.sam", &feats);
-            let feats = self.qwen2_model.forward(feats); // [1, 256, 896]
+
+            // Allow mixing SAM/Qwen2 dtype during debugging.
+            let qwen_dtype = self.qwen2_model.query_1024.weight.val().dtype();
+            if feats.dtype() != qwen_dtype {
+                feats = feats.cast(qwen_dtype);
+            }
+
+            let feats = self.qwen2_model.forward(feats); // [1, n_query, 896]
             dbg_stats("vision.global.qwen2", &feats);
-            let feats = self.projector.layers.forward(feats); // [1, 256, hidden]
+
+            // Allow mixing Qwen2/projector dtype during debugging.
+            let proj_dtype = self.projector.layers.weight.val().dtype();
+            let feats = if feats.dtype() == proj_dtype {
+                feats
+            } else {
+                feats.cast(proj_dtype)
+            };
+
+            let feats = self.projector.layers.forward(feats); // [1, n_query, hidden]
             dbg_stats("vision.global.proj", &feats);
             let [_, n_query, _] = feats.dims();
             feats.reshape([n_query, hidden])
@@ -176,21 +192,44 @@ impl<B: Backend> DeepseekOcr2Model<B> {
         // Optional local patches (each crop_image_size -> (crop/16)^2/16 tokens, typically 144 for 768).
         let vision = if let Some(patches) = patches {
             let [p, _, _, _] = patches.dims();
-            let feats = self.sam_model.forward(patches); // [P, 896, 12, 12] (for 768)
+            let mut feats = self.sam_model.forward(patches); // [P, 896, H, W]
             dbg_stats("vision.local.sam", &feats);
-            let feats = self.qwen2_model.forward(feats); // [P, 144, 896]
+
+            let qwen_dtype = self.qwen2_model.query_1024.weight.val().dtype();
+            if feats.dtype() != qwen_dtype {
+                feats = feats.cast(qwen_dtype);
+            }
+
+            let feats = self.qwen2_model.forward(feats); // [P, n_query, 896]
             dbg_stats("vision.local.qwen2", &feats);
-            let feats = self.projector.layers.forward(feats); // [P, 144, hidden]
+
+            let proj_dtype = self.projector.layers.weight.val().dtype();
+            let feats = if feats.dtype() == proj_dtype {
+                feats
+            } else {
+                feats.cast(proj_dtype)
+            };
+
+            let feats = self.projector.layers.forward(feats); // [P, n_query, hidden]
             dbg_stats("vision.local.proj", &feats);
             let [_, n_query, _] = feats.dims();
             let feats = feats.reshape([p * n_query, hidden]);
-            let sep = self.view_seperator.val().unsqueeze_dim(0);
+            let mut sep = self.view_seperator.val();
+            if sep.dtype() != proj_dtype {
+                sep = sep.cast(proj_dtype);
+            }
+            let sep = sep.unsqueeze_dim(0);
             // Match the HF reference implementation injection order (yes, this differs from the
             // tokenizer's `<image>` token expansion order):
             // local(patches) -> global(base) -> view_seperator.
             Tensor::cat(vec![feats, global, sep], 0)
         } else {
-            let sep = self.view_seperator.val().unsqueeze_dim(0);
+            let proj_dtype = self.projector.layers.weight.val().dtype();
+            let mut sep = self.view_seperator.val();
+            if sep.dtype() != proj_dtype {
+                sep = sep.cast(proj_dtype);
+            }
+            let sep = sep.unsqueeze_dim(0);
             Tensor::cat(vec![global, sep], 0)
         };
         // Cast vision tokens to match the language embedding dtype for injection.
