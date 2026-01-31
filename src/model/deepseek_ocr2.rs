@@ -156,7 +156,9 @@ impl<B: Backend> DeepseekOcr2Model<B> {
             }
         }
 
-        // Global view: [256, hidden]
+        // Global view: [n_query, hidden] where n_query depends on the SAM feature map size:
+        // - 1024 base -> 16x16 -> 256
+        // - 768  base -> 12x12 -> 144
         //
         // On Vulkan/WebGPU, Qwen2 vision ops are unstable in F16 for this model. Keep the whole
         // vision tower in F32, then cast to the language embedding dtype at the end.
@@ -167,10 +169,11 @@ impl<B: Backend> DeepseekOcr2Model<B> {
             dbg_stats("vision.global.qwen2", &feats);
             let feats = self.projector.layers.forward(feats); // [1, 256, hidden]
             dbg_stats("vision.global.proj", &feats);
-            feats.reshape([256, hidden])
+            let [_, n_query, _] = feats.dims();
+            feats.reshape([n_query, hidden])
         };
 
-        // Optional local patches (each 768 -> 12x12 -> 144 tokens).
+        // Optional local patches (each crop_image_size -> (crop/16)^2/16 tokens, typically 144 for 768).
         let vision = if let Some(patches) = patches {
             let [p, _, _, _] = patches.dims();
             let feats = self.sam_model.forward(patches); // [P, 896, 12, 12] (for 768)
@@ -179,7 +182,8 @@ impl<B: Backend> DeepseekOcr2Model<B> {
             dbg_stats("vision.local.qwen2", &feats);
             let feats = self.projector.layers.forward(feats); // [P, 144, hidden]
             dbg_stats("vision.local.proj", &feats);
-            let feats = feats.reshape([p * 144, hidden]);
+            let [_, n_query, _] = feats.dims();
+            let feats = feats.reshape([p * n_query, hidden]);
             let sep = self.view_seperator.val().unsqueeze_dim(0);
             // Match the HF reference implementation injection order (yes, this differs from the
             // tokenizer's `<image>` token expansion order):
